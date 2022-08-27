@@ -8,11 +8,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
@@ -39,6 +43,53 @@ func connectCluster(kubeConfig *string) *kubernetes.Clientset {
 	return client
 }
 
+func updateNodeMap(nodeLabelConfigMap *v1.ConfigMap, object runtime.Object, removed bool) {
+	node, ok := object.(*v1.Node)
+	if !ok {
+		return
+	}
+
+	fmt.Printf("Node %v\n", node)
+	for k, v := range node.Labels {
+		if strings.HasPrefix(k, "kubernetes.io") {
+			keys := strings.Split(k, "/")
+			fmt.Printf("\t%v: %v\n", keys[1], v)
+		} else {
+			continue
+		}
+
+		if removed {
+			delete(nodeLabelConfigMap.Data, k)
+		} else {
+			nodeLabelConfigMap.Data[k] = v
+		}
+	}
+}
+
+func watchNodes(client *kubernetes.Clientset, nodeLabelConfigMap *v1.ConfigMap, sigs chan os.Signal, done chan bool) {
+
+	node, err := client.CoreV1().Nodes().Watch(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		fmt.Printf("Got an error watching nodes %v\n", err)
+		done <- true
+	}
+
+	for {
+		select {
+		case <-sigs:
+			node.Stop()
+			done <- true
+		case event := <-node.ResultChan():
+			switch event.Type {
+			case watch.Added:
+				updateNodeMap(nodeLabelConfigMap, event.Object, false)
+			case watch.Deleted:
+				updateNodeMap(nodeLabelConfigMap, event.Object, true)
+			}
+		}
+	}
+}
+
 func main() {
 
 	var kubeConfig *string
@@ -51,6 +102,9 @@ func main() {
 	configmapName := flag.String("cmName", "", "Name of the configmap")
 	flag.Parse()
 
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
 	if *namespace == "" {
 		fmt.Printf("Failed to determine namespace where CM should be created\n")
 		os.Exit(1)
@@ -62,57 +116,19 @@ func main() {
 	}
 
 	client := connectCluster(kubeConfig)
-	existingNodes, err := client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
-		fmt.Printf("Failed to query nodes %v", err)
-		os.Exit(1)
+	immutable := false
+	nodeLabelConfigMap := &v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: *configmapName,
+		},
+		Data:      make(map[string]string),
+		Immutable: &immutable,
 	}
 
-	nodeLabelData := make(map[string]string)
-	for _, node := range existingNodes.Items {
-		fmt.Printf("Node information %v:\n", node.Name)
-		for k, v := range node.Labels {
-			if strings.HasPrefix(k, "kubernetes.io") {
-				keys := strings.Split(k, "/")
-				nodeLabelData[keys[1]] = v
-				fmt.Printf("\t%v: %v\n", keys[1], v)
-			}
-		}
-	}
-
-	exists := false
-	configMaps, err := client.CoreV1().ConfigMaps(*namespace).Get(context.TODO(), *configmapName, metav1.GetOptions{})
-	if err == nil {
-		exists = true
-	}
-
-	if !exists {
-		fmt.Printf("Creating new config map %s\n", *configmapName)
-		immutable := false
-		nodeLabelConfigMap := &v1.ConfigMap{
-			TypeMeta: metav1.TypeMeta{
-				Kind: "ConfigMap",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: *configmapName,
-			},
-			Immutable: &immutable,
-			Data:      nodeLabelData,
-		}
-		configMaps, err = client.CoreV1().ConfigMaps(*namespace).Create(context.TODO(), nodeLabelConfigMap, metav1.CreateOptions{})
-		if err != nil {
-			fmt.Printf("Failed to create basic configmap %v", err)
-			os.Exit(1)
-		}
-	} else {
-		fmt.Printf("Existing Node Label Maps")
-		for k, v := range configMaps.Data {
-			fmt.Printf("\t%v: %v\n", k, v)
-		}
-	}
-
-	// for {
-
-	// 	nodes, err := client.CoreV1().Nodes().Watch(context.TODO(), metav1.ListOptions{})
-	// }
+	done := make(chan bool, 1)
+	go watchNodes(client, nodeLabelConfigMap, sigs, done)
+	<-done
 }
